@@ -1,11 +1,16 @@
 import json
+import random
+import time
+from collections import deque
 from datetime import date
 from pathlib import Path
+from threading import Lock
 from urllib.parse import urlencode
 from urllib.request import urlopen
 from uuid import uuid4
 
 import flet as ft
+from fastapi import FastAPI
 
 
 DATA_FILE = Path.home() / ".daily_note_tasks.json"
@@ -15,6 +20,9 @@ PAPER = "#F6F5EF"
 INK = "#202C2A"
 MUTED = "#77807B"
 CORAL = "#CF6048"
+WEATHER_NOTIFICATIONS = deque(maxlen=50)
+WEATHER_NOTIFICATIONS_LOCK = Lock()
+WEATHER_NOTIFICATION_ID = 0
 
 WEATHER_LABELS = {
     0: ("快晴", "☀"), 1: ("晴れ", "☀"), 2: ("晴れ時々くもり", "⛅"), 3: ("くもり", "☁"),
@@ -184,21 +192,132 @@ def fetch_weather(city):
     }
 
 
-def make_recommendations(weather):
+def make_weather_alert(weather):
+    alerts = []
     if weather["rain"] >= 50 or weather["code"] >= 51:
-        recommendations = ["折りたたみ傘をバッグに入れる", "読書や映画など、室内の時間をつくる"]
+        alerts.append(f"雨の予報です（降水確率 {weather['rain']}%）。傘を用意してください。")
+    if weather["max"] >= 30:
+        alerts.append(f"最高気温は{weather['max']:.0f}℃の予報です。水分補給と暑さ対策を。")
+    wind_speed = weather["current"]["wind_speed_10m"]
+    if wind_speed >= 35:
+        alerts.append(f"現在の風速は{wind_speed:.0f} km/hです。屋外での活動に注意してください。")
+    if not alerts:
+        return None
+    return {
+        "title": f"{weather['city']}の天気に注意",
+        "body": "\n".join(alerts),
+    }
+
+
+def enqueue_weather_notification(alert):
+    global WEATHER_NOTIFICATION_ID
+    with WEATHER_NOTIFICATIONS_LOCK:
+        WEATHER_NOTIFICATION_ID += 1
+        WEATHER_NOTIFICATIONS.append({
+            "id": WEATHER_NOTIFICATION_ID,
+            "created_at": int(time.time() * 1000),
+            **alert,
+        })
+
+
+def make_recommendations(weather):
+    categories = {
+        "外出": [],
+        "運動": [],
+        "室内": [],
+        "休憩": [],
+        "体調管理": [],
+        "持ち物": [],
+        "安全": [],
+    }
+
+    def add(category, item, reason, period="いつでも"):
+        if not any(recommendation["text"] == item for recommendation in categories[category]):
+            categories[category].append({
+                "kind": category,
+                "text": item,
+                "reason": reason,
+                "period": period,
+            })
+
+    if weather["rain"] >= 50 or weather["code"] >= 51:
+        rain_reason = (
+            f"降水確率が{weather['rain']}%と高いため。"
+            if weather["rain"] >= 50
+            else "雨の予報が出ているため。"
+        )
+        add("持ち物", "折りたたみ傘をバッグに入れる", rain_reason, "朝")
+        add("室内", "屋外の予定は短めにして、室内の時間を増やす", rain_reason)
+        add("室内", "机まわりを5分だけ片付ける", rain_reason)
+        add("外出", "近場の用事をまとめて、雨にぬれる時間を減らす", rain_reason, "昼")
+        add("外出", "出かける際は、屋根のあるルートを選ぶ", rain_reason, "いつでも")
+        add("運動", "室内で5分だけストレッチをする", rain_reason)
+        add("運動", "好きな音楽に合わせて、室内で軽く体を動かす", rain_reason)
+        add("休憩", "読書や映画など、雨の日にちょうどいいゆったり行動を選ぶ", rain_reason)
+        add("休憩", "温かい飲み物を用意して一息つく", rain_reason)
     elif weather["max"] >= 28:
-        recommendations = ["午前中か夕方に散歩する", "水分補給をこまめにする"]
+        heat_reason = f"最高気温が{weather['max']:.0f}℃の予報のため。"
+        add("外出", "涼しい朝か夕方に散歩する", heat_reason, "朝")
+        add("外出", "日陰のある道を選んで短時間歩く", heat_reason, "昼")
+        add("運動", "涼しい時間帯に軽いウォーキングをする", heat_reason, "夕方・夜")
+        add("運動", "室内で軽いストレッチをする", heat_reason)
+        add("体調管理", "水分補給をこまめにして、日差しを避ける", heat_reason)
+        add("持ち物", "帽子や水分の入ったボトルを持ち歩く", heat_reason, "朝")
+        add("室内", "涼しい室内で読書や作業を進める", heat_reason)
+        add("室内", "カーテンを閉めて、部屋に熱がこもるのを防ぐ", heat_reason, "昼")
+        add("休憩", "涼しい場所で目を閉じて数分休む", heat_reason)
+        add("休憩", "好きな音楽を聴きながら、無理せず休憩する", heat_reason)
     elif weather["max"] <= 10:
-        recommendations = ["温かい飲み物を用意する", "外出は短時間にして室内の用事を進める"]
+        cold_reason = f"最高気温が{weather['max']:.0f}℃と低い予報のため。"
+        add("体調管理", "温かい飲み物を用意する", cold_reason, "朝")
+        add("外出", "外出は短時間にして室内の用事を進める", cold_reason)
+        add("外出", "日が出て暖かい時間帯に、近所を短く歩く", cold_reason, "昼")
+        add("体調管理", "暖かい服装で、体を冷やしすぎないようにする", cold_reason, "朝")
+        add("運動", "室内で軽いストレッチをして、体を温めておく", cold_reason)
+        add("運動", "部屋の中で足踏みをして、少し体を動かす", cold_reason)
+        add("室内", "温かい部屋で読書や勉強をする", cold_reason)
+        add("室内", "座ってできる片付けや作業をひとつ進める", cold_reason)
+        add("休憩", "温かい飲み物を飲みながら、ゆっくり休む", cold_reason)
     else:
-        recommendations = ["昼休みに15分だけ外を歩く", "窓を開けて部屋の空気を入れ替える"]
+        mild_reason = "極端な暑さや寒さの予報がなく、過ごしやすそうなため。"
+        add("外出", "昼休みに15分だけ外を歩く", mild_reason, "昼")
+        add("外出", "帰り道にいつもと違う道を歩いてみる", mild_reason, "夕方・夜")
+        add("室内", "窓を開けて部屋の空気を入れ替える", mild_reason, "昼")
+        add("室内", "机の上を5分だけ片付けて気分を整える", mild_reason)
+        add("休憩", "少しだけ好きな音楽を聴いて気分転換する", mild_reason)
+        add("休憩", "休憩中に深呼吸をして、目を閉じてひと休みする", mild_reason)
+        add("運動", "肩や首をほぐす軽い体操をする", mild_reason)
+        add("運動", "階段を使うか、短い散歩で軽く体を動かす", mild_reason)
 
     if weather["code"] in {0, 1} and 12 <= weather["max"] < 28:
-        recommendations.insert(0, "外でやりたかったことをひとつ実行する")
+        add("外出", "外でやりたかったことをひとつ実行する", "晴れの予報で、最高気温も過ごしやすい範囲のため。", "昼")
     if weather["current"]["wind_speed_10m"] >= 35:
-        recommendations.append("風が強いので、自転車や屋外作業は控える")
-    return recommendations[:3]
+        wind_speed = weather["current"]["wind_speed_10m"]
+        add("安全", "風が強いので、自転車や屋外作業は控える", f"現在の風速が{wind_speed:.0f} km/hと強いため。")
+    if weather["max"] >= 30:
+        add("安全", "日差しが強いので、日焼け止めを塗ってから外に出る", f"最高気温が{weather['max']:.0f}℃の予報のため。", "朝")
+    if 15 <= weather["max"] < 25 and weather["current"]["wind_speed_10m"] < 20:
+        add("外出", "気持ちいい日なので、少し長めに散歩して気分を整える", "気温が15〜24℃で、風も比較的弱いため。", "昼")
+    if weather["max"] <= 12:
+        add("休憩", "静かに休んで、体を温めてから動く", f"最高気温が{weather['max']:.0f}℃と低い予報のため。", "夕方・夜")
+
+    recommendations = []
+    order = ["安全", "持ち物", "体調管理", "外出", "運動", "室内", "休憩"]
+    for category in order:
+        recommendations.extend(categories[category])
+
+    return recommendations
+
+
+def group_recommendations(recommendations, category_filter="すべて"):
+    periods = ("朝", "昼", "夕方・夜", "いつでも")
+    grouped = {period: [] for period in periods}
+    for recommendation in recommendations:
+        if category_filter != "すべて" and recommendation["kind"] != category_filter:
+            continue
+        period = recommendation.get("period", "いつでも")
+        grouped.setdefault(period, []).append(recommendation)
+    return [(period, grouped[period]) for period in periods if grouped[period]]
 
 
 def make_day_advice(hourly):
@@ -257,16 +376,21 @@ def main(page: ft.Page):
 
     tasks = load_tasks()
     current_filter = "all"
+    recommendation_filter = "すべて"
+    recommendations = []
     today = ft.Text(date.today().strftime("%Y年%m月%d日"), size=12, color=MUTED)
     city_input = ft.TextField(value="東京", label="場所", hint_text="例：東京都、大阪府、北海道、那覇", expand=True, border_radius=6, border_color="#D4DED5", focused_border_color=GREEN, bgcolor="#FFFEFA")
     weather_status = ft.Text("場所を選ぶと、今日の気候を確認できます", size=12, color=MUTED)
     weather_summary = ft.Column(spacing=4)
     day_advice_list = ft.Column(spacing=8)
+    recommendation_filter_row = ft.Row(wrap=True, spacing=4, run_spacing=4)
     recommendation_list = ft.Column(spacing=8)
     task_input = ft.TextField(label="自分で追加", hint_text="例：夕方に散歩する", expand=True, border_radius=6, border_color="#D4DED5", focused_border_color=GREEN, bgcolor="#FFFEFA")
     task_list = ft.Column(spacing=0)
     task_count = ft.Text(color=MUTED, size=12)
     progress_label = ft.Text(color=MUTED, size=11)
+    review_count = ft.Text(color=MUTED, size=11)
+    review_list = ft.Column(spacing=4)
     clear_done_button = ft.TextButton("完了した行動を削除", icon=ft.Icons.DELETE_OUTLINE, style=ft.ButtonStyle(color=CORAL))
     quick_task_suggestions = [
         "10分だけ散歩する",
@@ -274,6 +398,10 @@ def main(page: ft.Page):
         "水分をたくさん取る",
         "部屋を少し片付ける",
         "好きな音楽を1曲聴く",
+        "15分だけ外を歩く",
+        "軽い体操をする",
+        "今日は少しゆっくり休む",
+        "窓を開けて気分転換する",
     ]
     quick_task_row = ft.Row(wrap=True, spacing=6, run_spacing=6)
     filter_buttons = {}
@@ -336,9 +464,18 @@ def main(page: ft.Page):
 
     def render_tasks():
         visible_tasks = [task for task in tasks if current_filter == "all" or (current_filter == "active" and not task["done"]) or (current_filter == "done" and task["done"])]
-        completed = sum(task["done"] for task in tasks)
+        completed_tasks = [task for task in tasks if task["done"]]
+        completed = len(completed_tasks)
         task_count.value = f"未完了 {len(tasks) - completed} 件"
         progress_label.value = f"{completed} / {len(tasks)} 件 完了" if tasks else "提案をチェックリストに追加できます"
+        review_count.value = f"{completed} 件完了"
+        review_list.controls = [
+            ft.Row([
+                ft.Icon(ft.Icons.CHECK_CIRCLE, color=GREEN, size=16),
+                ft.Text(task["text"], color=INK, size=13, expand=True),
+            ], spacing=8)
+            for task in completed_tasks
+        ] or [ft.Text("完了した行動はここに表示されます", color=MUTED, size=12)]
         clear_done_button.visible = completed > 0
         for key, button in filter_buttons.items():
             selected = key == current_filter
@@ -353,7 +490,74 @@ def main(page: ft.Page):
         task_list.controls = rows
         page.update()
 
+    def set_recommendation_filter(value):
+        nonlocal recommendation_filter
+        recommendation_filter = value
+        render_recommendations()
+
+    def shuffle_recommendations(event):
+        random.shuffle(recommendations)
+        render_recommendations()
+
+    def render_recommendations():
+        categories = list(dict.fromkeys(item["kind"] for item in recommendations))
+        filter_options = ["すべて", *categories]
+        if recommendation_filter not in filter_options:
+            set_recommendation_filter("すべて")
+            return
+        recommendation_filter_row.controls = [
+            ft.TextButton(
+                category,
+                on_click=lambda event, value=category: set_recommendation_filter(value),
+                style=ft.ButtonStyle(
+                    color=GREEN if category == recommendation_filter else MUTED,
+                    bgcolor=GREEN_LIGHT if category == recommendation_filter else "transparent",
+                    shape=ft.RoundedRectangleBorder(radius=16),
+                ),
+            )
+            for category in filter_options
+        ]
+
+        recommendation_list.controls = []
+        for period, items in group_recommendations(recommendations, recommendation_filter):
+            recommendation_list.controls.append(
+                ft.Text(period, size=13, color=GREEN, weight=ft.FontWeight.BOLD)
+            )
+            for recommendation in items:
+                label = recommendation["kind"]
+                text = recommendation["text"]
+                reason = recommendation["reason"]
+                recommendation_list.controls.append(
+                    ft.Container(
+                        content=ft.Row([
+                            ft.Container(
+                                content=ft.Text(label, size=10, weight=ft.FontWeight.BOLD, color=GREEN),
+                                padding=ft.Padding.all(6),
+                                bgcolor=GREEN_LIGHT,
+                                border_radius=12,
+                            ),
+                            ft.Column([
+                                ft.Text(text, color=INK, size=14),
+                                ft.Text(f"理由：{reason}", color=MUTED, size=11),
+                            ], spacing=3, expand=True),
+                            ft.TextButton("追加", on_click=lambda event, value=text: add_task(value)),
+                        ], spacing=8, alignment=ft.MainAxisAlignment.START),
+                        padding=8,
+                        border=ft.Border.all(1, "#E3E3D9"),
+                        border_radius=8,
+                        bgcolor="#FFFEFA",
+                    )
+                )
+        if not recommendation_list.controls:
+            recommendation_list.controls.append(
+                ft.Text("このカテゴリの提案はありません", color=MUTED, size=12)
+            )
+        page.update()
+
     def show_weather(data):
+        nonlocal recommendations, recommendation_filter
+        recommendation_filter = "すべて"
+        recommendations = make_recommendations(data)
         label, icon = WEATHER_LABELS.get(data["code"], ("天候", "☁"))
         weather_status.value = f"{data['city']} / {data['country']} の今日の予報"
         weather_summary.controls = [ft.Row([ft.Text(icon, size=42), ft.Column([ft.Text(label, size=20, color=INK, weight=ft.FontWeight.BOLD), ft.Text(f"現在 {data['current']['temperature_2m']:.0f}°C  ·  最高 {data['max']:.0f}°C / 最低 {data['min']:.0f}°C", color=MUTED, size=13), ft.Text(f"降水確率 {data['rain']}%  ·  風速 {data['current']['wind_speed_10m']:.0f} km/h", color=MUTED, size=12)], spacing=4)], spacing=16)]
@@ -372,8 +576,7 @@ def main(page: ft.Page):
             )
             for item in make_day_advice(data["hourly"])
         ]
-        recommendation_list.controls = [ft.Row([ft.Text("✓", color=GREEN, size=17, weight=ft.FontWeight.BOLD), ft.Text(recommendation, color=INK, size=14, expand=True), ft.TextButton("追加", on_click=lambda event, value=recommendation: add_task(value))], spacing=8) for recommendation in make_recommendations(data)]
-        page.update()
+        render_recommendations()
 
     def update_weather():
         city = city_input.value.strip()
@@ -384,7 +587,11 @@ def main(page: ft.Page):
         weather_status.value = "天気を確認しています..."
         page.update()
         try:
-            show_weather(fetch_weather(city))
+            weather = fetch_weather(city)
+            show_weather(weather)
+            alert = make_weather_alert(weather)
+            if alert:
+                enqueue_weather_notification(alert)
         except (OSError, ValueError, KeyError, json.JSONDecodeError):
             weather_status.value = "天気を取得できませんでした。場所名を変えて試してください。"
             page.update()
@@ -402,6 +609,15 @@ def main(page: ft.Page):
         ft.Text("一日のアドバイス", size=14, color=INK, weight=ft.FontWeight.BOLD),
         day_advice_list,
         ft.Text("今日の行動ヒント", size=14, color=INK, weight=ft.FontWeight.BOLD),
+        recommendation_filter_row,
+        ft.Row([
+            ft.TextButton(
+                "提案をシャッフル",
+                icon=ft.Icons.SHUFFLE,
+                on_click=shuffle_recommendations,
+                style=ft.ButtonStyle(color=GREEN),
+            ),
+        ], alignment=ft.MainAxisAlignment.END),
         recommendation_list,
     ], spacing=14), padding=20, bgcolor="#FFFEFA", border=ft.Border.all(1, "#E3E3D9"), border_radius=8)
     checklist_panel = ft.Container(content=ft.Column([
@@ -411,6 +627,13 @@ def main(page: ft.Page):
         quick_task_row,
         ft.Row([ft.Row(list(filter_buttons.values()), spacing=0), task_count], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
         task_list,
+        ft.Container(content=ft.Column([
+            ft.Row([
+                ft.Text("完了した行動を振り返る", size=14, color=INK, weight=ft.FontWeight.BOLD),
+                review_count,
+            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            review_list,
+        ], spacing=8), padding=12, bgcolor=GREEN_LIGHT, border_radius=8),
         ft.Row([progress_label, clear_done_button], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
     ], spacing=12), padding=20, bgcolor="#FFFEFA", border=ft.Border.all(1, "#E3E3D9"), border_radius=8)
 
@@ -436,5 +659,29 @@ def main(page: ft.Page):
     update_weather()
 
 
+def create_web_app():
+    flet_app = ft.run(
+        main,
+        export_asgi_app=True,
+        assets_dir=str(Path(__file__).parent / "assets"),
+    )
+    web_app = FastAPI()
+
+    @web_app.get("/api/weather-notifications")
+    def get_weather_notifications(after: int = 0):
+        with WEATHER_NOTIFICATIONS_LOCK:
+            notifications = [
+                notification
+                for notification in WEATHER_NOTIFICATIONS
+                if notification["id"] > after
+            ]
+        return {"notifications": notifications}
+
+    web_app.mount("/", flet_app)
+    return web_app
+
+
 if __name__ == "__main__":
-    ft.run(main, view=ft.AppView.WEB_BROWSER)
+    import uvicorn
+
+    uvicorn.run(create_web_app(), host="0.0.0.0", port=8000)

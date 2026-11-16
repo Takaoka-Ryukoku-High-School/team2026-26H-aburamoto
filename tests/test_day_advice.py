@@ -1,6 +1,11 @@
 import unittest
 
-from main import make_day_advice
+from main import (
+    group_recommendations,
+    make_day_advice,
+    make_recommendations,
+    make_weather_alert,
+)
 
 
 class DayAdviceTest(unittest.TestCase):
@@ -52,6 +57,117 @@ class DayAdviceTest(unittest.TestCase):
         advice = make_day_advice(hourly)
 
         self.assertEqual([item["period"] for item in advice], ["昼"])
+
+    def test_recommendations_include_multiple_categories(self):
+        weather = {
+            "rain": 20,
+            "code": 1,
+            "max": 22,
+            "current": {"wind_speed_10m": 8},
+        }
+
+        recommendations = make_recommendations(weather)
+
+        self.assertGreater(len(recommendations), 3)
+        self.assertTrue(any(item["kind"] == "外出" for item in recommendations))
+        self.assertTrue(any(item["kind"] == "室内" for item in recommendations))
+        self.assertTrue(any(item["kind"] == "休憩" for item in recommendations))
+        self.assertTrue(all(item["reason"] for item in recommendations))
+        self.assertIn(
+            "外でやりたかったことをひとつ実行する",
+            [item["text"] for item in recommendations],
+        )
+
+    def test_action_hint_categories_offer_multiple_choices(self):
+        weather = {
+            "rain": 20,
+            "code": 1,
+            "max": 22,
+            "current": {"wind_speed_10m": 8},
+        }
+
+        recommendations = make_recommendations(weather)
+
+        for category in ("外出", "運動", "室内", "休憩"):
+            with self.subTest(category=category):
+                self.assertGreaterEqual(
+                    sum(item["kind"] == category for item in recommendations),
+                    2,
+                )
+
+    def test_rainy_weather_still_offers_varied_action_categories(self):
+        weather = {
+            "rain": 70,
+            "code": 61,
+            "max": 18,
+            "current": {"wind_speed_10m": 10},
+        }
+
+        recommendations = make_recommendations(weather)
+
+        for category in ("外出", "運動", "室内", "休憩"):
+            with self.subTest(category=category):
+                self.assertGreaterEqual(
+                    sum(item["kind"] == category for item in recommendations),
+                    2,
+                )
+
+    def test_weather_alert_includes_relevant_warning_conditions(self):
+        weather = {
+            "city": "Tokyo",
+            "rain": 70,
+            "code": 61,
+            "max": 32,
+            "current": {"wind_speed_10m": 40},
+        }
+
+        alert = make_weather_alert(weather)
+
+        self.assertIn("Tokyo", alert["title"])
+        self.assertIn("降水確率 70%", alert["body"])
+        self.assertIn("最高気温は32℃", alert["body"])
+        self.assertIn("風速は40 km/h", alert["body"])
+
+    def test_weather_alert_is_omitted_when_no_warning_threshold_is_met(self):
+        weather = {
+            "city": "Tokyo",
+            "rain": 20,
+            "code": 1,
+            "max": 22,
+            "current": {"wind_speed_10m": 8},
+        }
+
+        self.assertIsNone(make_weather_alert(weather))
+
+    def test_safety_recommendations_are_shown_before_other_categories(self):
+        weather = {
+            "rain": 0,
+            "code": 1,
+            "max": 32,
+            "current": {"wind_speed_10m": 40},
+        }
+
+        recommendations = make_recommendations(weather)
+
+        self.assertEqual(recommendations[0]["kind"], "安全")
+        self.assertIn("自転車や屋外作業", recommendations[0]["text"])
+        self.assertIn("風速が40 km/h", recommendations[0]["reason"])
+
+    def test_recommendations_are_grouped_by_time_and_can_be_filtered(self):
+        recommendations = [
+            {"period": "昼", "kind": "外出", "text": "昼に散歩"},
+            {"period": "朝", "kind": "持ち物", "text": "傘を用意"},
+            {"period": "いつでも", "kind": "外出", "text": "水分補給"},
+        ]
+
+        grouped = group_recommendations(recommendations)
+        filtered = group_recommendations(recommendations, "外出")
+
+        self.assertEqual([period for period, _ in grouped], ["朝", "昼", "いつでも"])
+        self.assertEqual(
+            [item["text"] for _, items in filtered for item in items],
+            ["昼に散歩", "水分補給"],
+        )
 
 
 if __name__ == "__main__":
