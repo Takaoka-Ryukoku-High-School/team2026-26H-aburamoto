@@ -1,0 +1,16 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run DAILY NOTE app",
+			"type": "shell",
+			"command": ".venv/bin/python",
+			"args": [
+				"main.py"
+			],
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}
