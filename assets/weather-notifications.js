@@ -1,8 +1,12 @@
 (() => {
   const enabledKey = "daily-note-weather-notifications-enabled";
   const cursorKey = "daily-note-weather-notifications-cursor";
+  const timeKey = "daily-note-weather-notification-time";
+  const deliveredKey = "daily-note-weather-notification-delivered-date";
   const panel = document.createElement("div");
   const button = document.createElement("button");
+  const timeLabel = document.createElement("label");
+  const timeInput = document.createElement("input");
 
   panel.style.cssText = [
     "position:fixed",
@@ -27,7 +31,26 @@
     "cursor:pointer",
   ].join(";");
   panel.append(button);
+  timeLabel.textContent = "通知時刻 ";
+  timeLabel.style.cssText = "display:block;margin-top:6px;color:#77807b;";
+  timeInput.type = "time";
+  timeInput.value = localStorage.getItem(timeKey) || "07:30";
+  timeInput.style.cssText = "border:1px solid #d4ded5;border-radius:5px;padding:3px;";
+  timeLabel.append(timeInput);
+  panel.append(timeLabel);
   document.body.append(panel);
+
+  timeInput.addEventListener("change", () => {
+    localStorage.setItem(timeKey, timeInput.value || "07:30");
+  });
+
+  function isScheduledTime() {
+    const configured = localStorage.getItem(timeKey) || "07:30";
+    const now = new Date();
+    const current = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+    const today = now.toISOString().slice(0, 10);
+    return current >= configured && localStorage.getItem(deliveredKey) !== today;
+  }
 
   function isEnabled() {
     return localStorage.getItem(enabledKey) === "true";
@@ -74,7 +97,7 @@
   let lastId = Number(localStorage.getItem(cursorKey) || "0");
 
   async function pollNotifications() {
-    if ("Notification" in window && Notification.permission === "granted" && isEnabled()) {
+    if ("Notification" in window && Notification.permission === "granted" && isEnabled() && isScheduledTime()) {
       try {
         const response = await fetch(
           `/api/weather-notifications?after=${lastId}`,
@@ -91,6 +114,7 @@
             new Notification(notification.title, { body: notification.body });
           }
         }
+        localStorage.setItem(deliveredKey, new Date().toISOString().slice(0, 10));
       } catch (error) {
         console.error("Could not check weather notifications:", error);
       }

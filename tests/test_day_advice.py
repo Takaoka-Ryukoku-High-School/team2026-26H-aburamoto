@@ -2,6 +2,8 @@ import unittest
 
 from main import (
     group_recommendations,
+    make_hourly_forecast,
+    make_multi_day_forecast,
     make_day_advice,
     make_recommendations,
     make_weather_alert,
@@ -168,6 +170,77 @@ class DayAdviceTest(unittest.TestCase):
             [item["text"] for _, items in filtered for item in items],
             ["昼に散歩", "水分補給"],
         )
+
+    def test_recommendations_can_be_filtered_by_category_and_period(self):
+        recommendations = [
+            {"period": "朝", "kind": "持ち物", "text": "傘を用意"},
+            {"period": "昼", "kind": "外出", "text": "昼に散歩"},
+            {"period": "昼", "kind": "休憩", "text": "昼休みに休む"},
+        ]
+
+        filtered = group_recommendations(recommendations, "外出", "昼")
+
+        self.assertEqual(
+            [item["text"] for _, items in filtered for item in items],
+            ["昼に散歩"],
+        )
+
+    def test_multi_day_forecast_contains_seven_days(self):
+        weather = {
+            "daily": {
+                "time": ["2026-11-20", "2026-11-21", "2026-11-22"],
+                "max": [18, 19, 20],
+                "min": [10, 11, 12],
+                "rain": [20, 60, 0],
+                "code": [1, 61, 0],
+                "uv_index_max": [2.4, 3.1, 4.0],
+                "sunrise": [
+                    "2026-11-20T06:30",
+                    "2026-11-21T06:31",
+                    "2026-11-22T06:32",
+                ],
+                "sunset": [
+                    "2026-11-20T16:40",
+                    "2026-11-21T16:39",
+                    "2026-11-22T16:38",
+                ],
+            }
+        }
+
+        forecast = make_multi_day_forecast(weather)
+
+        self.assertEqual(len(forecast), 3)
+        self.assertEqual(forecast[1]["rain"], 60)
+        self.assertIn("雨", forecast[1]["label"])
+        self.assertEqual([item["weekday"] for item in forecast], ["金", "土", "日"])
+        self.assertEqual(forecast[1]["uv_index_max"], 3.1)
+        self.assertEqual(forecast[1]["sunrise"], "2026-11-21T06:31")
+        self.assertEqual(forecast[1]["sunset"], "2026-11-21T16:39")
+
+    def test_hourly_forecast_starts_at_current_hour_and_limits_to_one_day(self):
+        hourly = {
+            "time": [
+                f"2026-11-20T{hour:02d}:00"
+                for hour in range(24)
+            ],
+            "temperature_2m": list(range(24)),
+            "precipitation_probability": [0] * 24,
+            "weather_code": [1] * 24,
+            "wind_speed_10m": [5] * 24,
+        }
+
+        forecast = make_hourly_forecast(hourly, "2026-11-20T08:30", limit=4)
+
+        self.assertEqual(
+            [item["time"] for item in forecast],
+            [
+                "2026-11-20T08:00",
+                "2026-11-20T09:00",
+                "2026-11-20T10:00",
+                "2026-11-20T11:00",
+            ],
+        )
+        self.assertEqual(forecast[0]["temperature"], 8)
 
 
 if __name__ == "__main__":

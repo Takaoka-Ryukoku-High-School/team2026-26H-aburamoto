@@ -14,6 +14,7 @@ from fastapi import FastAPI
 
 
 DATA_FILE = Path.home() / ".daily_note_tasks.json"
+PLACE_HISTORY_FILE = Path.home() / ".daily_note_places.json"
 GREEN = "#2E6654"
 GREEN_LIGHT = "#E2EDE5"
 PAPER = "#F6F5EF"
@@ -154,27 +155,80 @@ def save_tasks(tasks):
     DATA_FILE.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def load_place_history():
+    try:
+        places = json.loads(PLACE_HISTORY_FILE.read_text(encoding="utf-8"))
+        if isinstance(places, list):
+            return [place for place in places if isinstance(place, str)]
+    except (OSError, json.JSONDecodeError):
+        pass
+    return []
+
+
+def save_place_history(places):
+    PLACE_HISTORY_FILE.write_text(
+        json.dumps(places[:8], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def is_japanese_place_name(place_name):
+    return any(
+        "\u3040" <= character <= "\u30ff"
+        or "\u4e00" <= character <= "\u9fff"
+        for character in place_name
+    )
+
+
+def fetch_japanese_location(place_name):
+    search_names = [place_name]
+    if not place_name.endswith(("市", "区", "町", "村")):
+        search_names.insert(0, f"{place_name}市")
+
+    for search_name in search_names:
+        query = urlencode({"q": search_name})
+        with urlopen(
+            f"https://msearch.gsi.go.jp/address-search/AddressSearch?{query}",
+            timeout=10,
+        ) as response:
+            results = json.loads(response.read().decode("utf-8"))
+        if results:
+            location = results[0]
+            longitude, latitude = location["geometry"]["coordinates"]
+            return {
+                "name": location["properties"]["title"],
+                "country": "日本",
+                "latitude": latitude,
+                "longitude": longitude,
+            }
+
+    raise ValueError("その場所は見つかりませんでした")
+
+
 def fetch_weather(city):
     place_name = (city or "").strip()
     search_name = resolve_place_name(place_name)
-    geocoding_params = {"name": search_name, "count": 1, "language": "en", "format": "json"}
-    if place_name in PREFECTURE_ALIASES:
-        geocoding_params["countryCode"] = "JP"
-    query = urlencode(geocoding_params)
-    with urlopen(f"https://geocoding-api.open-meteo.com/v1/search?{query}", timeout=10) as response:
-        locations = json.loads(response.read().decode("utf-8")).get("results", [])
-    if not locations:
-        raise ValueError("その場所は見つかりませんでした")
+    if is_japanese_place_name(place_name) and place_name not in CITY_ALIASES and place_name not in PREFECTURE_ALIASES:
+        location = fetch_japanese_location(place_name)
+    else:
+        geocoding_params = {"name": search_name, "count": 1, "language": "en", "format": "json"}
+        if place_name in CITY_ALIASES or place_name in PREFECTURE_ALIASES:
+            geocoding_params["countryCode"] = "JP"
+        query = urlencode(geocoding_params)
+        with urlopen(f"https://geocoding-api.open-meteo.com/v1/search?{query}", timeout=10) as response:
+            locations = json.loads(response.read().decode("utf-8")).get("results", [])
+        if not locations:
+            raise ValueError("その場所は見つかりませんでした")
+        location = locations[0]
 
-    location = locations[0]
     query = urlencode({
         "latitude": location["latitude"],
         "longitude": location["longitude"],
         "current": "temperature_2m,weather_code,wind_speed_10m",
         "hourly": "temperature_2m,precipitation_probability,weather_code,wind_speed_10m",
-        "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code",
+        "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code,uv_index_max,sunrise,sunset",
         "timezone": "auto",
-        "forecast_days": 1,
+        "forecast_days": 7,
     })
     with urlopen(f"https://api.open-meteo.com/v1/forecast?{query}", timeout=10) as response:
         forecast = json.loads(response.read().decode("utf-8"))
@@ -189,7 +243,69 @@ def fetch_weather(city):
         "min": daily["temperature_2m_min"][0],
         "rain": daily["precipitation_probability_max"][0] or 0,
         "code": daily["weather_code"][0],
+        "daily": {
+            "time": daily.get("time", []),
+            "max": daily["temperature_2m_max"],
+            "min": daily["temperature_2m_min"],
+            "rain": daily["precipitation_probability_max"],
+            "code": daily["weather_code"],
+            "uv_index_max": daily["uv_index_max"],
+            "sunrise": daily["sunrise"],
+            "sunset": daily["sunset"],
+        },
     }
+
+
+def make_multi_day_forecast(weather):
+    daily = weather.get("daily")
+    if not daily:
+        return []
+    forecast = []
+    for index, date_text in enumerate(daily["time"]):
+        code = daily["code"][index]
+        label, icon = WEATHER_LABELS.get(code, ("天候", "☁"))
+        weekday = ("月", "火", "水", "木", "金", "土", "日")[
+            date.fromisoformat(date_text).weekday()
+        ]
+        forecast.append({
+            "date": date_text,
+            "weekday": weekday,
+            "label": label,
+            "icon": icon,
+            "max": daily["max"][index],
+            "min": daily["min"][index],
+            "rain": daily["rain"][index] or 0,
+            "uv_index_max": daily["uv_index_max"][index],
+            "sunrise": daily["sunrise"][index],
+            "sunset": daily["sunset"][index],
+        })
+    return forecast
+
+
+def make_hourly_forecast(hourly, current_time=None, limit=24):
+    times = hourly.get("time", [])
+    current_hour = current_time[:13] if current_time else None
+    if current_hour:
+        start_index = next(
+            (index for index, value in enumerate(times) if value.startswith(current_hour)),
+            0,
+        )
+    else:
+        start_index = 0
+
+    forecast = []
+    for index in range(start_index, min(start_index + limit, len(times))):
+        code = hourly["weather_code"][index]
+        label, icon = WEATHER_LABELS.get(code, ("天候", "☁"))
+        forecast.append({
+            "time": times[index],
+            "label": label,
+            "icon": icon,
+            "temperature": hourly["temperature_2m"][index],
+            "rain": hourly["precipitation_probability"][index] or 0,
+            "wind": hourly["wind_speed_10m"][index],
+        })
+    return forecast
 
 
 def make_weather_alert(weather):
@@ -309,13 +425,15 @@ def make_recommendations(weather):
     return recommendations
 
 
-def group_recommendations(recommendations, category_filter="すべて"):
+def group_recommendations(recommendations, category_filter="すべて", period_filter="すべて"):
     periods = ("朝", "昼", "夕方・夜", "いつでも")
     grouped = {period: [] for period in periods}
     for recommendation in recommendations:
         if category_filter != "すべて" and recommendation["kind"] != category_filter:
             continue
         period = recommendation.get("period", "いつでも")
+        if period_filter != "すべて" and period != period_filter:
+            continue
         grouped.setdefault(period, []).append(recommendation)
     return [(period, grouped[period]) for period in periods if grouped[period]]
 
@@ -375,15 +493,22 @@ def main(page: ft.Page):
     page.scroll = ft.ScrollMode.AUTO
 
     tasks = load_tasks()
+    place_history = load_place_history()
     current_filter = "all"
     recommendation_filter = "すべて"
+    recommendation_period_filter = "すべて"
     recommendations = []
     today = ft.Text(date.today().strftime("%Y年%m月%d日"), size=12, color=MUTED)
     city_input = ft.TextField(value="東京", label="場所", hint_text="例：東京都、大阪府、北海道、那覇", expand=True, border_radius=6, border_color="#D4DED5", focused_border_color=GREEN, bgcolor="#FFFEFA")
     weather_status = ft.Text("場所を選ぶと、今日の気候を確認できます", size=12, color=MUTED)
     weather_summary = ft.Column(spacing=4)
+    hourly_forecast_list = ft.Row(scroll=ft.ScrollMode.AUTO, spacing=8)
+    multi_day_list = ft.Row(wrap=True, spacing=8, run_spacing=8)
+    forecast_chart = ft.Row(scroll=ft.ScrollMode.AUTO, spacing=4)
+    place_history_row = ft.Row(wrap=True, spacing=6, run_spacing=6)
     day_advice_list = ft.Column(spacing=8)
     recommendation_filter_row = ft.Row(wrap=True, spacing=4, run_spacing=4)
+    recommendation_period_filter_row = ft.Row(wrap=True, spacing=4, run_spacing=4)
     recommendation_list = ft.Column(spacing=8)
     task_input = ft.TextField(label="自分で追加", hint_text="例：夕方に散歩する", expand=True, border_radius=6, border_color="#D4DED5", focused_border_color=GREEN, bgcolor="#FFFEFA")
     task_list = ft.Column(spacing=0)
@@ -411,6 +536,25 @@ def main(page: ft.Page):
             save_tasks(tasks)
         except OSError:
             progress_label.value = "保存できませんでした。書き込み権限をご確認ください。"
+
+    def render_place_history():
+        place_history_row.controls = [
+            ft.TextButton(
+                place,
+                on_click=lambda event, value=place: use_history_place(value),
+                style=ft.ButtonStyle(
+                    color=GREEN,
+                    bgcolor=GREEN_LIGHT,
+                    shape=ft.RoundedRectangleBorder(radius=16),
+                ),
+            )
+            for place in place_history
+        ]
+
+    def use_history_place(place):
+        city_input.value = place
+        page.update()
+        update_weather()
 
     def add_task(text=None):
         value = (text if text is not None else task_input.value).strip()
@@ -484,7 +628,14 @@ def main(page: ft.Page):
         rows = []
         for task in visible_tasks:
             checkbox = ft.Checkbox(value=task["done"], label=task["text"], expand=True, active_color=GREEN, label_style=ft.TextStyle(color="#929992" if task["done"] else INK, decoration=ft.TextDecoration.LINE_THROUGH if task["done"] else None, size=14), on_change=lambda event, task_id=task["id"]: toggle_task(task_id))
-            rows.extend([ft.Row([checkbox, ft.IconButton(icon=ft.Icons.DELETE_OUTLINE, icon_color=MUTED, tooltip=f"「{task['text']}」を削除", on_click=lambda event, task_id=task["id"]: delete_task(task_id))], spacing=8), ft.Divider(height=1, thickness=1, color="#DEDFD5")])
+            restore_button = ft.TextButton(
+                "未完了に戻す",
+                icon=ft.Icons.REPLAY,
+                visible=task["done"],
+                on_click=lambda event, task_id=task["id"]: toggle_task(task_id),
+                style=ft.ButtonStyle(color=GREEN),
+            )
+            rows.extend([ft.Row([checkbox, restore_button, ft.IconButton(icon=ft.Icons.DELETE_OUTLINE, icon_color=MUTED, tooltip=f"「{task['text']}」を削除", on_click=lambda event, task_id=task["id"]: delete_task(task_id))], spacing=8), ft.Divider(height=1, thickness=1, color="#DEDFD5")])
         if not visible_tasks:
             rows = [ft.Container(content=ft.Text("ここに今日の行動が並びます", size=13, color=MUTED, text_align=ft.TextAlign.CENTER), padding=28, alignment=ft.Alignment.CENTER)]
         task_list.controls = rows
@@ -495,9 +646,55 @@ def main(page: ft.Page):
         recommendation_filter = value
         render_recommendations()
 
+    def set_recommendation_period_filter(value):
+        nonlocal recommendation_period_filter
+        recommendation_period_filter = value
+        render_recommendations()
+
     def shuffle_recommendations(event):
         random.shuffle(recommendations)
         render_recommendations()
+
+    def make_forecast_chart(forecast):
+        controls = []
+        chart_height = 60
+        for item in forecast:
+            temperature_height = max(
+                2, min(chart_height, (item["max"] + 10) * chart_height / 50)
+            )
+            rain_height = max(2, item["rain"] * chart_height / 100)
+            controls.append(
+                ft.Column([
+                    ft.Text(item["weekday"], size=9, color=MUTED),
+                    ft.Container(
+                        content=ft.Row([
+                            ft.Column([
+                                ft.Container(
+                                    width=8,
+                                    height=temperature_height,
+                                    bgcolor=CORAL,
+                                    border_radius=3,
+                                )
+                            ], alignment=ft.MainAxisAlignment.END, height=chart_height),
+                            ft.Column([
+                                ft.Container(
+                                    width=8,
+                                    height=rain_height,
+                                    bgcolor="#6A9FC6",
+                                    border_radius=3,
+                                )
+                            ], alignment=ft.MainAxisAlignment.END, height=chart_height),
+                        ], spacing=3, alignment=ft.MainAxisAlignment.CENTER),
+                        height=chart_height,
+                    ),
+                    ft.Text(
+                        f"{item['max']:.0f}° · {item['rain']:.0f}%",
+                        size=8,
+                        color=INK,
+                    ),
+                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=1)
+            )
+        return controls
 
     def render_recommendations():
         categories = list(dict.fromkeys(item["kind"] for item in recommendations))
@@ -517,9 +714,25 @@ def main(page: ft.Page):
             )
             for category in filter_options
         ]
-
+        period_options = ["すべて", "朝", "昼", "夕方・夜", "いつでも"]
+        recommendation_period_filter_row.controls = [
+            ft.TextButton(
+                period,
+                on_click=lambda event, value=period: set_recommendation_period_filter(value),
+                style=ft.ButtonStyle(
+                    color=GREEN if period == recommendation_period_filter else MUTED,
+                    bgcolor=GREEN_LIGHT if period == recommendation_period_filter else "transparent",
+                    shape=ft.RoundedRectangleBorder(radius=16),
+                ),
+            )
+            for period in period_options
+        ]
         recommendation_list.controls = []
-        for period, items in group_recommendations(recommendations, recommendation_filter):
+        for period, items in group_recommendations(
+            recommendations,
+            recommendation_filter,
+            recommendation_period_filter,
+        ):
             recommendation_list.controls.append(
                 ft.Text(period, size=13, color=GREEN, weight=ft.FontWeight.BOLD)
             )
@@ -555,12 +768,72 @@ def main(page: ft.Page):
         page.update()
 
     def show_weather(data):
-        nonlocal recommendations, recommendation_filter
+        nonlocal recommendations, recommendation_filter, recommendation_period_filter, place_history
         recommendation_filter = "すべて"
+        recommendation_period_filter = "すべて"
         recommendations = make_recommendations(data)
+        place_name = data["city"]
+        place_history = [place_name] + [place for place in place_history if place != place_name]
+        try:
+            save_place_history(place_history)
+        except OSError:
+            pass
+        render_place_history()
         label, icon = WEATHER_LABELS.get(data["code"], ("天候", "☁"))
         weather_status.value = f"{data['city']} / {data['country']} の今日の予報"
-        weather_summary.controls = [ft.Row([ft.Text(icon, size=42), ft.Column([ft.Text(label, size=20, color=INK, weight=ft.FontWeight.BOLD), ft.Text(f"現在 {data['current']['temperature_2m']:.0f}°C  ·  最高 {data['max']:.0f}°C / 最低 {data['min']:.0f}°C", color=MUTED, size=13), ft.Text(f"降水確率 {data['rain']}%  ·  風速 {data['current']['wind_speed_10m']:.0f} km/h", color=MUTED, size=12)], spacing=4)], spacing=16)]
+        today_forecast = data["daily"]
+        sunrise = today_forecast["sunrise"][0][11:16]
+        sunset = today_forecast["sunset"][0][11:16]
+        uv_index = today_forecast["uv_index_max"][0]
+        weather_summary.controls = [ft.Row([ft.Text(icon, size=42), ft.Column([ft.Text(label, size=20, color=INK, weight=ft.FontWeight.BOLD), ft.Text(f"現在 {data['current']['temperature_2m']:.0f}°C  ·  最高 {data['max']:.0f}°C / 最低 {data['min']:.0f}°C", color=MUTED, size=13), ft.Text(f"降水確率 {data['rain']}%  ·  風速 {data['current']['wind_speed_10m']:.0f} km/h", color=MUTED, size=12), ft.Text(f"UV指数 最大 {uv_index:.1f}  ·  日の出 {sunrise}  ·  日の入り {sunset}", color=MUTED, size=12)], spacing=4)], spacing=16)]
+        hourly_forecast_list.controls = [
+            ft.Container(
+                content=ft.Column([
+                    ft.Text(item["time"][11:16], size=11, color=MUTED),
+                    ft.Text(item["icon"], size=24),
+                    ft.Text(f"{item['temperature']:.0f}°", size=16, color=INK, weight=ft.FontWeight.BOLD),
+                    ft.Text(f"雨 {item['rain']}%", size=10, color=GREEN),
+                    ft.Text(f"風 {item['wind']:.0f}", size=10, color=MUTED),
+                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=4),
+                width=68,
+                padding=8,
+                bgcolor="#FFFEFA",
+                border=ft.Border.all(1, "#E3E3D9"),
+                border_radius=8,
+            )
+            for item in make_hourly_forecast(
+                data["hourly"],
+                data["current"].get("time"),
+            )
+        ]
+        multi_day_forecast = make_multi_day_forecast(data)
+        forecast_chart.controls = make_forecast_chart(multi_day_forecast)
+        multi_day_list.controls = [
+            ft.Container(
+                content=ft.Column([
+                    ft.Text(
+                        f"今日 ({item['weekday']})"
+                        if index == 0
+                        else f"{item['weekday']} {date_text}",
+                        size=11,
+                        color=GREEN,
+                        weight=ft.FontWeight.BOLD,
+                    ),
+                    ft.Text(item["icon"], size=24),
+                    ft.Text(item["label"], size=11, color=INK),
+                    ft.Text(f"{item['min']:.0f}〜{item['max']:.0f}°C", size=12, color=MUTED),
+                    ft.Text(f"雨 {item['rain']}%", size=11, color=MUTED),
+                    ft.Text(f"UV {item['uv_index_max']:.1f}", size=10, color=MUTED),
+                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=3),
+                width=82,
+                padding=8,
+                bgcolor=GREEN_LIGHT if index == 0 else "#FFFEFA",
+                border=ft.Border.all(1, "#E3E3D9"),
+                border_radius=8,
+            )
+            for index, item in enumerate(multi_day_forecast)
+            for date_text in [item["date"][5:].replace("-", "/")]
+        ]
         day_advice_list.controls = [
             ft.Container(
                 content=ft.Row([
@@ -605,11 +878,24 @@ def main(page: ft.Page):
     weather_panel = ft.Container(content=ft.Column([
         ft.Row([ft.Text("今日の気候", size=18, color=INK, weight=ft.FontWeight.BOLD), ft.Text("行動のヒント", size=12, color=GREEN)], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
         ft.Row([city_input, ft.Button("天気を見る", on_click=lambda event: update_weather(), bgcolor=GREEN, color="white", height=48)], spacing=10),
+        ft.Text("最近の場所", size=11, color=MUTED),
+        place_history_row,
         weather_status, weather_summary,
+        ft.Text("時間ごとの予報", size=13, color=INK, weight=ft.FontWeight.BOLD),
+        hourly_forecast_list,
+        ft.Text("7日間の予報", size=13, color=INK, weight=ft.FontWeight.BOLD),
+        multi_day_list,
+        ft.Row([
+            ft.Text("週間の気温・降水確率", size=13, color=INK, weight=ft.FontWeight.BOLD),
+            ft.Text("■ 気温", size=10, color=CORAL),
+            ft.Text("■ 降水", size=10, color="#6A9FC6"),
+        ], spacing=8, wrap=True),
+        forecast_chart,
         ft.Text("一日のアドバイス", size=14, color=INK, weight=ft.FontWeight.BOLD),
         day_advice_list,
         ft.Text("今日の行動ヒント", size=14, color=INK, weight=ft.FontWeight.BOLD),
         recommendation_filter_row,
+        recommendation_period_filter_row,
         ft.Row([
             ft.TextButton(
                 "提案をシャッフル",
@@ -655,6 +941,7 @@ def main(page: ft.Page):
     page.on_resize = resize_page
     page.add(app_container)
     render_quick_tasks()
+    render_place_history()
     render_tasks()
     update_weather()
 
